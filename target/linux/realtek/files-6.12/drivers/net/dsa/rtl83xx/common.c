@@ -29,8 +29,6 @@ extern const struct dsa_switch_ops rtl930x_switch_ops;
 extern const struct phylink_pcs_ops rtl83xx_pcs_ops;
 extern const struct phylink_pcs_ops rtl93xx_pcs_ops;
 
-DEFINE_MUTEX(smi_lock);
-
 int rtl83xx_port_get_stp_state(struct rtl838x_switch_priv *priv, int port)
 {
 	u32 msti = 0;
@@ -270,24 +268,27 @@ static int rtldsa_bus_c45_write(struct mii_bus *bus, int addr, int devad, int re
 
 static int __init rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 {
+	struct device_node *dn, *phy_node, *led_node, *np, *mii_np;
 	struct device *dev = priv->dev;
-	struct device_node *dn, *phy_node, *led_node, *mii_np = dev->of_node;
 	struct mii_bus *bus;
 	int ret;
 	u32 pn;
 
-	pr_debug("In %s\n", __func__);
-	mii_np = of_find_compatible_node(NULL, NULL, "realtek,rtl838x-mdio");
-	if (mii_np) {
-		pr_debug("Found compatible MDIO node!\n");
-	} else {
-		dev_err(priv->dev, "no %s child node found", "mdio-bus");
+	np = of_find_compatible_node(NULL, NULL, "realtek,otto-mdio");
+	if (!np) {
+		dev_err(priv->dev, "mdio controller node not found");
+		return -ENODEV;
+	}
+
+	mii_np = of_get_child_by_name(np, "mdio-bus");
+	if (!mii_np) {
+		dev_err(priv->dev, "mdio-bus subnode not found");
 		return -ENODEV;
 	}
 
 	priv->parent_bus = of_mdio_find_bus(mii_np);
 	if (!priv->parent_bus) {
-		pr_debug("Deferring probe of mdio bus\n");
+		dev_dbg(priv->dev, "Deferring probe of mdio bus\n");
 		return -EPROBE_DEFER;
 	}
 	if (!of_device_is_available(mii_np))
@@ -335,22 +336,6 @@ static int __init rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 			continue;
 
 		phy_node = of_parse_phandle(dn, "phy-handle", 0);
-
-		/* Major cleanup is needed...
-		 *
-		 * We use virtual "phys" as containers for mac
-		 * properties like the SERDES channel, even for simple
-		 * SFP slots.  "pseudo-phy-handle" is a hack to
-		 * support this construct and still allow pluggable
-		 * phys.
-		 *
-		 * The SERDES map is most likely static by port number
-		 * for each SoC.  No need to put that into the device
-		 * tree in the first place.
-		 */
-		if (!phy_node)
-			phy_node = of_parse_phandle(dn, "pseudo-phy-handle", 0);
-
 		if (!phy_node) {
 			if (pn != priv->cpu_port)
 				dev_err(priv->dev, "Port node %d misses phy-handle\n", pn);
@@ -363,8 +348,6 @@ static int __init rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 
 		if (of_get_phy_mode(dn, &interface))
 			interface = PHY_INTERFACE_MODE_NA;
-		if (interface == PHY_INTERFACE_MODE_HSGMII)
-			priv->ports[pn].is2G5 = true;
 		if (interface == PHY_INTERFACE_MODE_USXGMII)
 			priv->ports[pn].is2G5 = priv->ports[pn].is10G = true;
 		if (interface == PHY_INTERFACE_MODE_10GBASER)
@@ -436,8 +419,6 @@ static int __init rtl83xx_mdio_probe(struct rtl838x_switch_priv *priv)
 		rtl8380_sds_power(24, 1);
 		rtl8380_sds_power(26, 1);
 	}
-
-	pr_debug("%s done\n", __func__);
 
 	return 0;
 }
@@ -1346,7 +1327,7 @@ static int rtl83xx_netevent_event(struct notifier_block *this,
 
 		pr_debug("%s: updating neighbour on port %d, mac %016llx\n",
 			__func__, port, net_work->mac);
-		schedule_work(&net_work->work);
+		queue_work(priv->wq, &net_work->work);
 		if (err)
 			netdev_warn(dev, "failed to handle neigh update (err %d)\n", err);
 		break;
@@ -1468,9 +1449,48 @@ static int rtl83xx_fib_event(struct notifier_block *this, unsigned long event, v
 		break;
 	}
 
-	schedule_work(&fib_work->work);
+	queue_work(priv->wq, &fib_work->work);
 
 	return NOTIFY_DONE;
+}
+
+/*
+ * TODO: This check is usually built into the DSA initialization functions. After carving
+ * out the mdio driver from the ethernet driver, there are two drivers that must be loaded
+ * before the DSA setup can start. This driver has severe issues with handling of deferred
+ * probing. For now provide this function for early dependency checks.
+ */
+static int rtldsa_ethernet_loaded(struct platform_device *pdev)
+{
+	struct device_node *dn = pdev->dev.of_node;
+	struct device_node *ports, *port;
+	int ret = -EPROBE_DEFER;
+
+	ports = of_get_child_by_name(dn, "ports");
+	if (!ports)
+		return -ENODEV;
+
+	for_each_child_of_node(ports, port) {
+		struct device_node *eth_np;
+		struct platform_device *eth_pdev;
+
+		eth_np = of_parse_phandle(port, "ethernet", 0);
+		if (!eth_np)
+			continue;
+
+		eth_pdev = of_find_device_by_node(eth_np);
+		of_node_put(eth_np);
+
+		if (!eth_pdev)
+			continue;
+
+		if (eth_pdev->dev.driver)
+			ret = 0;
+	}
+
+	of_node_put(ports);
+
+	return ret;	
 }
 
 static int __init rtl83xx_sw_probe(struct platform_device *pdev)
@@ -1485,6 +1505,10 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		dev_err(dev, "No DT found\n");
 		return -EINVAL;
 	}
+	
+	err = rtldsa_ethernet_loaded(pdev);
+	if (err)
+		return err;
 
 	/* Initialize access to RTL switch tables */
 	rtl_table_init();
@@ -1502,6 +1526,7 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 	priv->ds->ops = &rtl83xx_switch_ops;
 	priv->ds->needs_standalone_vlan_filtering = true;
 	priv->dev = dev;
+	dev_set_drvdata(dev, priv);
 
 	err = devm_mutex_init(dev, &priv->reg_mutex);
 	if (err)
@@ -1551,6 +1576,9 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		priv->r = &rtl930x_reg;
 		priv->ds->num_ports = 29;
 		priv->fib_entries = 16384;
+		/* TODO A version based on CHIP_INFO and MODEL_NAME_INFO should
+		 * be constructed. For now, just set it to a static 'A'
+		 */
 		priv->version = RTL8390_VERSION_A;
 		priv->n_lags = 16;
 		sw_w32(1, RTL930X_ST_CTRL);
@@ -1568,9 +1596,16 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		priv->r = &rtl931x_reg;
 		priv->ds->num_ports = 57;
 		priv->fib_entries = 16384;
+		/* TODO A version based on CHIP_INFO and MODEL_NAME_INFO should
+		 * be constructed. For now, just set it to a static 'A'
+		 */
 		priv->version = RTL8390_VERSION_A;
 		priv->n_lags = 16;
+		sw_w32(1, RTL931x_ST_CTRL);
 		priv->l2_bucket_size = 8;
+		priv->n_pie_blocks = 16;
+		priv->port_ignore = 0x3f;
+		priv->n_counters = 2048;
 		break;
 	}
 	pr_debug("Chip version %c\n", priv->version);
@@ -1599,10 +1634,16 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		return err;
 	}
 
+	priv->wq = create_singlethread_workqueue("rtl83xx");
+	if (!priv->wq) {
+		dev_err(dev, "Error creating workqueue: %d\n", err);
+		return -ENOMEM;
+	}
+
 	err = dsa_register_switch(priv->ds);
 	if (err) {
 		dev_err(dev, "Error registering switch: %d\n", err);
-		return err;
+		goto err_register_switch;
 	}
 
 	/* dsa_to_port returns dsa_port from the port list in
@@ -1630,7 +1671,7 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		                  IRQF_SHARED, "rtl839x-link-state", priv->ds);
 		break;
 	case RTL9300_FAMILY_ID:
-		err = request_irq(priv->link_state_irq, rtl930x_switch_irq,
+		err = request_irq(priv->link_state_irq, rtldsa_930x_switch_irq,
 				  IRQF_SHARED, "rtl930x-link-state", priv->ds);
 		break;
 	case RTL9310_FAMILY_ID:
@@ -1690,8 +1731,9 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		goto err_register_fib_nb;
 
 	/* TODO: put this into l2_setup() */
-	/* Flood BPDUs to all ports including cpu-port */
-	if (soc_info.family != RTL9300_FAMILY_ID) {
+	switch (soc_info.family) {
+	default:
+		/* Flood BPDUs to all ports including cpu-port */
 		bpdu_mask = soc_info.family == RTL8380_FAMILY_ID ? 0x1FFFFFFF : 0x1FFFFFFFFFFFFF;
 		priv->r->set_port_reg_be(bpdu_mask, priv->r->rma_bpdu_fld_pmask);
 
@@ -1699,8 +1741,11 @@ static int __init rtl83xx_sw_probe(struct platform_device *pdev)
 		sw_w32(7, priv->r->spcl_trap_eapol_ctrl);
 
 		rtl838x_dbgfs_init(priv);
-	} else {
+		break;
+	case RTL9300_FAMILY_ID:
+	case RTL9310_FAMILY_ID:
 		rtl930x_dbgfs_init(priv);
+		break;
 	}
 
 	return 0;
@@ -1710,13 +1755,37 @@ err_register_fib_nb:
 err_register_ne_nb:
 	unregister_netdevice_notifier(&priv->nb);
 err_register_nb:
+	dsa_switch_shutdown(priv->ds);
+err_register_switch:
+	destroy_workqueue(priv->wq);
+
 	return err;
 }
 
 static void rtl83xx_sw_remove(struct platform_device *pdev)
 {
+	struct rtl838x_switch_priv *priv = platform_get_drvdata(pdev);
+
+	if (!priv)
+		return;
+
 	/* TODO: */
 	pr_debug("Removing platform driver for rtl83xx-sw\n");
+
+	/* unregister notifiers which will create workqueue entries with
+	 * references to the switch structures. Also stop self-arming delayed
+	 * work items to avoid them still accessing the DSA structures
+	 * when they are getting shut down.
+	 */
+	unregister_fib_notifier(&init_net, &priv->fib_nb);
+	unregister_netevent_notifier(&priv->ne_nb);
+	cancel_delayed_work_sync(&priv->counters_work);
+
+	dsa_switch_shutdown(priv->ds);
+
+	destroy_workqueue(priv->wq);
+
+	dev_set_drvdata(&pdev->dev, NULL);
 }
 
 static const struct of_device_id rtl83xx_switch_of_ids[] = {
